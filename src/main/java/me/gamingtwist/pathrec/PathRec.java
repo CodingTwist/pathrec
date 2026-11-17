@@ -18,10 +18,9 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
 /**
- * Records the player's position to a CSV while walking, for tracing paths onto the map.
+ * Records the player's position to a .json file while walking, for tracing paths onto the map.
  *
- * <p>Rows are {@code ms,x,y,z,dim,block,ground_y}; mark rows add an 8th column with the label.
- * Each CSV gets a same-named .json with who/where/when and totals.
+ * <p>Each run is one file: who/where/when and totals, then a {@code path} array of points.
  * Use the hotkeys (F6 record, F7 pause, F8 undo, F9 mark; rebindable in Controls) or
  * {@code /pathrec start [name]|stop|pause|undo|mark <text>}. Undo drops the last few metres and
  * holds recording until you walk back to the glowing marker.

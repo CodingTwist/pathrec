@@ -6,11 +6,10 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
-import java.io.PrintWriter;
-import java.nio.channels.FileChannel;
-import java.nio.file.StandardOpenOption;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
@@ -31,28 +30,31 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 
 /**
- * One recording session: tracks the player and writes the CSV and its .json sidecar.
+ * One recording session: tracks the player and writes everything to one .json file.
  *
  * <p>Fields read by {@link Overlay} are package-private; only this class writes them.
  */
 class Recorder {
   /** Minimum horizontal move between rows, in blocks. */
   private static final double STEP = 1.0;
-  /** Sidecar JSON layout version; bump when the CSV or JSON shape changes so readers can branch. */
-  private static final int FORMAT = 1;
-  /** Position rows removed per undo press (about this many metres). */
+  /** JSON layout version; bump when the shape changes so readers can branch. */
+  private static final int FORMAT = 2;
+  /** How often the file is rewritten while walking, in ms; caps what a crash can lose. */
+  private static final long SAVE_EVERY = 5000;
+  /** Position points removed per undo press (about this many metres). */
   private static final int UNDO = 10;
   /** How close, in blocks, you must get to the undo marker for recording to carry on. */
   private static final double RESUME_RADIUS = 2.0;
 
   /**
-   * One written CSV row; {@code end} is the file length after it, so undo can truncate to it.
+   * One recorded point; {@code json} is what goes in the file.
    * {@code y} is the top of the ground block so jumps don't lift the drawn path.
    */
-  record Row(long end, double x, double y, double z, double dist, boolean mark) {}
+  record Row(double x, double y, double z, double dist, boolean mark, JsonObject json) {}
 
-  private PrintWriter out;
+  private boolean recording;
   private File file;
+  private long lastSave;
   private String name, started;
   private double lastX = Double.NaN, lastZ = Double.NaN;
   double distance;
@@ -60,27 +62,18 @@ class Recorder {
   long startMs;
   boolean paused;
   final List<Row> history = new ArrayList<>();
-  private long headerEnd;
   /** Where to walk back to after an undo; null when recording normally. */
   Row resume;
 
   boolean isRecording() {
-    return out != null;
+    return recording;
   }
 
   String start(String name) {
-    if (out != null) return "already recording " + file.getName();
+    if (recording) return "already recording " + file.getName();
     File dir = new File(Minecraft.getInstance().gameDirectory, "pathrec");
     dir.mkdirs();
-    file = new File(dir, LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")) + ".csv");
-    try {
-      out = new PrintWriter(new FileWriter(file));
-    } catch (IOException e) {
-      return "can't open " + file + ": " + e.getMessage();
-    }
-    out.println("ms,x,y,z,dim,block,ground_y");
-    out.flush();
-    headerEnd = file.length();
+    file = new File(dir, LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")) + ".json");
     history.clear();
     resume = null;
     lastX = lastZ = Double.NaN;
@@ -91,22 +84,24 @@ class Recorder {
     this.name = name;
     started = OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString();
     // Written now as well as at stop so a crash still leaves who/where/when.
-    writeMeta(null);
+    if (save(null) != null) return "not recording";
+    recording = true;
     return "recording to " + file.getName();
   }
 
   Component stop() {
-    if (out == null) return Component.literal("not recording");
-    out.close();
-    out = null;
-    writeMeta(OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString());
+    if (!recording) return Component.literal("not recording");
+    recording = false;
+    if (save(OffsetDateTime.now().truncatedTo(ChronoUnit.SECONDS).toString()) != null) {
+      return Component.literal("final save failed, the file has everything up to the last save");
+    }
     return Component.literal(String.format(Locale.ROOT, "saved %d points (%.0f m) → ", rows, distance))
         .append(Component.literal(file.getName()).withStyle(s -> s.withUnderlined(true)
             .withClickEvent(new ClickEvent.OpenFile(file.getParentFile()))));
   }
 
   String pause() {
-    if (out == null) return "not recording";
+    if (!recording) return "not recording";
     paused = !paused;
     // Start fresh on resume so the detour isn't counted as one long step.
     lastX = lastZ = Double.NaN;
@@ -115,14 +110,15 @@ class Recorder {
 
   String mark(String text) {
     LocalPlayer p = Minecraft.getInstance().player;
-    if (out == null || p == null) return "not recording";
-    write(p, text.replace(",", " "));
+    if (!recording || p == null) return "not recording";
+    write(p, text);
     marks++;
+    save(null);
     return "marked: " + text;
   }
 
   String undo() {
-    if (out == null) return "not recording";
+    if (!recording) return "not recording";
     int n = 0;
     while (!history.isEmpty() && n < UNDO) {
       if (history.removeLast().mark) marks--;
@@ -132,26 +128,17 @@ class Recorder {
       }
     }
     Row last = history.isEmpty() ? null : history.getLast();
-    out.close();
-    try {
-      try (FileChannel ch = FileChannel.open(file.toPath(), StandardOpenOption.WRITE)) {
-        ch.truncate(last == null ? headerEnd : last.end);
-      }
-      out = new PrintWriter(new FileWriter(file, true));
-    } catch (IOException e) {
-      out = null;
-      return "undo failed, recording stopped: " + e.getMessage();
-    }
     distance = last == null ? 0 : last.dist;
     lastX = last == null ? Double.NaN : last.x;
     lastZ = last == null ? Double.NaN : last.z;
     resume = last;
+    save(null);
     return last == null ? "undid everything" : "undid " + n + " points, walk back to the marker";
   }
 
-  /** Writes a row if the player has moved far enough since the last one; called every tick. */
+  /** Adds a point if the player has moved far enough since the last one; called every tick. */
   void sample(LocalPlayer p) {
-    if (out == null) return;
+    if (!recording) return;
     if (p == null) {
       // Logged out or disconnected: close the file rather than leave it dangling.
       say(stop());
@@ -173,6 +160,7 @@ class Recorder {
       lastZ = p.getZ();
       rows++;
     }
+    if (System.currentTimeMillis() - lastSave >= SAVE_EVERY) save(null);
   }
 
   private void write(LocalPlayer p, String mark) {
@@ -183,17 +171,31 @@ class Recorder {
     while (pos.getY() > level.getMinY() && !isGround(level, pos, state)) {
       state = level.getBlockState(pos.move(0, -1, 0));
     }
-    out.printf(Locale.ROOT, "%d,%.2f,%.2f,%.2f,%s,%s,%d%s%n", System.currentTimeMillis(),
-        p.getX(), p.getY(), p.getZ(), level.dimension().identifier(),
-        BuiltInRegistries.BLOCK.getKey(state.getBlock()), pos.getY(),
-        mark == null ? "" : "," + mark);
-    // Flush every row so a crash keeps everything walked so far.
-    out.flush();
-    history.add(new Row(file.length(), p.getX(), pos.getY() + 1, p.getZ(), distance, mark != null));
+    JsonObject j = new JsonObject();
+    j.addProperty("ms", System.currentTimeMillis());
+    j.addProperty("x", round(p.getX()));
+    j.addProperty("y", round(p.getY()));
+    j.addProperty("z", round(p.getZ()));
+    j.addProperty("dim", level.dimension().identifier().toString());
+    j.addProperty("block", BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
+    j.addProperty("ground_y", pos.getY());
+    if (mark != null) j.addProperty("mark", mark);
+    history.add(new Row(p.getX(), pos.getY() + 1, p.getZ(), distance, mark != null, j));
   }
 
-  /** Writes the .json sidecar next to the CSV; {@code ended} is null while recording. */
-  private void writeMeta(String ended) {
+  private static double round(double v) {
+    return Math.round(v * 100) / 100.0;
+  }
+
+  /**
+   * Rewrites the whole .json file; {@code ended} is null while recording.
+   *
+   * <p>Writes to a temp file then renames it, so a crash mid-write never leaves a broken file.
+   *
+   * @return an error message, or null on success
+   */
+  private String save(String ended) {
+    lastSave = System.currentTimeMillis();
     Minecraft mc = Minecraft.getInstance();
     JsonObject m = new JsonObject();
     m.addProperty("format", FORMAT);
@@ -212,15 +214,19 @@ class Recorder {
     m.addProperty("distance_m", Math.round(distance));
     m.addProperty("marks", marks);
     m.addProperty("step_m", STEP);
-    JsonArray cols = new JsonArray();
-    for (String c : "ms,x,y,z,dim,block,ground_y,mark".split(",")) cols.add(c);
-    m.add("columns", cols);
-    File json = new File(file.getParentFile(), file.getName().replaceFirst("\\.csv$", ".json"));
-    try (FileWriter w = new FileWriter(json)) {
-      new GsonBuilder().setPrettyPrinting().serializeNulls().create().toJson(m, w);
+    JsonArray path = new JsonArray();
+    for (Row r : history) path.add(r.json);
+    m.add("path", path);
+    Path tmp = file.toPath().resolveSibling(file.getName() + ".tmp");
+    try {
+      Files.writeString(tmp, new GsonBuilder().setPrettyPrinting().serializeNulls().create().toJson(m));
+      Files.move(tmp, file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     } catch (IOException e) {
-      say("can't write " + json.getName() + ": " + e.getMessage());
+      String msg = "can't write " + file.getName() + ": " + e.getMessage();
+      say(msg);
+      return msg;
     }
+    return null;
   }
 
   private static boolean isGround(Level level, BlockPos pos, BlockState state) {
