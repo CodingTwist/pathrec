@@ -21,17 +21,6 @@ Keys can be rebound under Controls -> pathrec.
 
 After an undo, recording holds until you walk back to the orange beam; the HUD points the way. Recording stops on its own if you disconnect.
 
-## Output
-
-Files go to `.minecraft/pathrec/`, named by start time (`20261117-142530.csv`). Click the filename in chat after stopping to open the folder.
-
-The CSV gets a row each time you move 1 block horizontally:
-
-```
-ms,x,y,z,dim,block,ground_y
-1763389530123,104.50,64.00,-220.31,minecraft:overworld,minecraft:grass_block,63
-```
-
 
 ## Build
 
