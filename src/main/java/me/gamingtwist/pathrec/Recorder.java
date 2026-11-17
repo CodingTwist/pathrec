@@ -4,7 +4,9 @@ import static me.gamingtwist.pathrec.PathRec.say;
 
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -64,18 +66,27 @@ class Recorder {
   final List<Row> history = new ArrayList<>();
   /** Where to walk back to after an undo; null when recording normally. */
   Row resume;
+  /** Last block the player stood on; reused mid-jump so any block type works as a path. */
+  private BlockPos groundPos;
+  private BlockState groundState;
 
   boolean isRecording() {
     return recording;
   }
 
+  /** Folder recordings are saved in. */
+  static File dir() {
+    return new File(Minecraft.getInstance().gameDirectory, "pathrec");
+  }
+
   String start(String name) {
     if (recording) return "already recording " + file.getName();
-    File dir = new File(Minecraft.getInstance().gameDirectory, "pathrec");
+    File dir = dir();
     dir.mkdirs();
     file = new File(dir, LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")) + ".json");
     history.clear();
     resume = null;
+    groundPos = null;
     lastX = lastZ = Double.NaN;
     rows = marks = 0;
     distance = 0;
@@ -87,6 +98,60 @@ class Recorder {
     if (save(null) != null) return "not recording";
     recording = true;
     return "recording to " + file.getName();
+  }
+
+  /**
+   * Reopens a saved recording and keeps appending to it.
+   *
+   * <p>Holds recording until the player walks back to the last point, like after an undo.
+   */
+  String load(String fileName) {
+    if (recording) return "already recording " + file.getName();
+    if (fileName.contains("/") || fileName.contains("\\") || fileName.contains("..")) return "bad file name";
+    File f = new File(dir(), fileName);
+    if (!f.isFile()) return "no such file " + fileName;
+    List<Row> rowsIn = new ArrayList<>();
+    int r = 0, mk = 0;
+    double dist = 0, px = Double.NaN, pz = Double.NaN;
+    JsonObject m;
+    try {
+      m = JsonParser.parseString(Files.readString(f.toPath())).getAsJsonObject();
+      if (m.get("format").getAsInt() != FORMAT) return fileName + " is from another version, can't resume";
+      for (JsonElement e : m.getAsJsonArray("path")) {
+        JsonObject j = e.getAsJsonObject();
+        double x = j.get("x").getAsDouble(), z = j.get("z").getAsDouble();
+        boolean isMark = j.has("mark");
+        // Same distance rule as sample(): only path points count, marks don't move you.
+        if (isMark) mk++;
+        else {
+          if (!Double.isNaN(px)) dist += Math.hypot(x - px, z - pz);
+          px = x;
+          pz = z;
+          r++;
+        }
+        rowsIn.add(new Row(x, j.get("ground_y").getAsInt() + 1, z, dist, isMark, j));
+      }
+    } catch (IOException | RuntimeException e) {
+      return "can't read " + fileName + ": " + e.getMessage();
+    }
+    file = f;
+    name = m.get("name").isJsonNull() ? null : m.get("name").getAsString();
+    started = m.get("started").getAsString();
+    history.clear();
+    history.addAll(rowsIn);
+    rows = r;
+    marks = mk;
+    distance = dist;
+    lastX = px;
+    lastZ = pz;
+    resume = history.isEmpty() ? null : history.getLast();
+    groundPos = null;
+    paused = false;
+    startMs = System.currentTimeMillis();
+    // Saved now so "ended" goes back to null right away.
+    if (save(null) != null) return "not recording";
+    recording = true;
+    return resume == null ? "resumed " + fileName : "resumed " + fileName + ", walk back to the marker";
   }
 
   Component stop() {
@@ -145,6 +210,11 @@ class Recorder {
       return;
     }
     if (paused) return;
+    // Every tick, not just every step, so a step taken mid-jump still knows the last ground.
+    if (p.onGround()) {
+      groundPos = p.getOnPos();
+      groundState = p.level().getBlockState(groundPos);
+    }
     if (resume != null) {
       double rx = p.getX() - resume.x, rz = p.getZ() - resume.z;
       // Don't record the walk back, or the undone detour comes right back.
@@ -165,11 +235,24 @@ class Recorder {
 
   private void write(LocalPlayer p, String mark) {
     Level level = p.level();
-    BlockPos.MutableBlockPos pos = BlockPos.containing(p.getX(), p.getY(), p.getZ()).mutable();
-    // Scan down from the feet so this works while flying; skip leaves and plants.
-    BlockState state = level.getBlockState(pos);
-    while (pos.getY() > level.getMinY() && !isGround(level, pos, state)) {
-      state = level.getBlockState(pos.move(0, -1, 0));
+    boolean flying = p.getAbilities().flying || p.isFallFlying();
+    BlockPos.MutableBlockPos pos;
+    BlockState state;
+    if (p.onGround()) {
+      pos = p.getOnPos().mutable();
+      state = level.getBlockState(pos);
+    } else if (!flying && groundPos != null
+        && p.getY() >= groundPos.getY() + 0.9 && p.getY() < groundPos.getY() + 3) {
+      // Jumping: still level with or above the last ground, so it's the same path.
+      pos = groundPos.mutable();
+      state = groundState;
+    } else {
+      // Fell off or flying: scan down. Flying skips leaves so treetops don't count as ground.
+      pos = p.blockPosition().mutable();
+      state = level.getBlockState(pos);
+      while (pos.getY() > level.getMinY() && !isGround(level, pos, state, flying)) {
+        state = level.getBlockState(pos.move(0, -1, 0));
+      }
     }
     JsonObject j = new JsonObject();
     j.addProperty("ms", System.currentTimeMillis());
@@ -231,8 +314,9 @@ class Recorder {
     return null;
   }
 
-  private static boolean isGround(Level level, BlockPos pos, BlockState state) {
+  private static boolean isGround(Level level, BlockPos pos, BlockState state, boolean skipLeaves) {
     if (!state.getFluidState().isEmpty()) return true;
-    return !state.is(BlockTags.LEAVES) && !state.getCollisionShape(level, pos).isEmpty();
+    if (skipLeaves && state.is(BlockTags.LEAVES)) return false;
+    return !state.getCollisionShape(level, pos).isEmpty();
   }
 }

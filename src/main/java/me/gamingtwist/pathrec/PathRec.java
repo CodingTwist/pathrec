@@ -5,6 +5,10 @@ import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.literal;
 
 import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import java.io.File;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -14,6 +18,7 @@ import net.fabricmc.fabric.api.client.rendering.v1.level.LevelExtractionEvents;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
@@ -22,8 +27,9 @@ import net.minecraft.resources.Identifier;
  *
  * <p>Each run is one file: who/where/when and totals, then a {@code path} array of points.
  * Use the hotkeys (F6 record, F7 pause, F8 undo, F9 mark; rebindable in Controls) or
- * {@code /pathrec start [name]|stop|pause|undo|mark <text>}. Undo drops the last few metres and
- * holds recording until you walk back to the glowing marker.
+ * {@code /pathrec start [name]|stop|pause|undo|mark <text>|resume <file>}. Undo drops the last
+ * few metres and holds recording until you walk back to the glowing marker; resume does the same
+ * for the end of a saved recording.
  */
 public class PathRec implements ClientModInitializer {
   private static final KeyMapping.Category CATEGORY =
@@ -43,6 +49,9 @@ public class PathRec implements ClientModInitializer {
             .then(literal("start").executes(c -> say(rec.start(null)))
                 .then(argument("name", StringArgumentType.greedyString())
                     .executes(c -> say(rec.start(StringArgumentType.getString(c, "name"))))))
+            .then(literal("resume").then(argument("file", StringArgumentType.greedyString())
+                .suggests((c, b) -> SharedSuggestionProvider.suggest(savedFiles(), b))
+                .executes(c -> say(rec.load(StringArgumentType.getString(c, "file"))))))
             .then(literal("stop").executes(c -> say(rec.stop())))
             .then(literal("pause").executes(c -> say(rec.pause())))
             .then(literal("undo").executes(c -> say(rec.undo())))
@@ -56,6 +65,16 @@ public class PathRec implements ClientModInitializer {
 
   private static KeyMapping key(String name, int code) {
     return KeyMappingHelper.registerKeyMapping(new KeyMapping("key.pathrec." + name, code, CATEGORY));
+  }
+
+  /** Saved recording file names, newest first. */
+  private static List<String> savedFiles() {
+    File[] files = Recorder.dir().listFiles((d, n) -> n.endsWith(".json"));
+    if (files == null) return List.of();
+    return Arrays.stream(files)
+        .sorted(Comparator.comparingLong(File::lastModified).reversed())
+        .map(File::getName)
+        .toList();
   }
 
   private void tick(Minecraft mc) {
