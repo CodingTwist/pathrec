@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "pathrec",
+  "version": "${version}",
+  "name": "pathrec",
+  "description": "Records your walk to .minecraft/pathrec/*.csv. F6 record, F7 pause, F8 undo, F9 mark (rebindable), or /pathrec start|stop|pause|undo|mark <text>.",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["me.gamingtwist.pathrec.PathRec"]
+  },
+  "depends": {
+    "fabricloader": "*",
+    "fabric-api": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}

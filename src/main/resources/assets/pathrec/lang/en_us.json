@@ -1,0 +1,7 @@
+{
+  "key.category.pathrec.main": "pathrec",
+  "key.pathrec.toggle": "Start/stop recording",
+  "key.pathrec.pause": "Pause/resume recording",
+  "key.pathrec.mark": "Drop numbered mark",
+  "key.pathrec.undo": "Undo last few metres"
+}
