@@ -203,8 +203,10 @@ class Recorder {
     m.addProperty("player", mc.getUser().getName());
     m.addProperty("uuid", String.valueOf(mc.getUser().getProfileId()));
     m.addProperty("server", mc.getCurrentServer() == null ? null : mc.getCurrentServer().ip);
-    m.addProperty("world", mc.getSingleplayerServer() == null ? null
-        : mc.getSingleplayerServer().getWorldData().getLevelName());
+    // Multiplayer clients never get the world name, so fall back to the dimension.
+    m.addProperty("world", mc.getSingleplayerServer() != null
+        ? mc.getSingleplayerServer().getWorldData().getLevelName()
+        : mc.level == null ? null : mc.level.dimension().identifier().toString());
     m.addProperty("mc", SharedConstants.getCurrentVersion().name());
     m.addProperty("mod", FabricLoader.getInstance().getModContainer("pathrec")
         .map(c -> c.getMetadata().getVersion().getFriendlyString()).orElse(null));
